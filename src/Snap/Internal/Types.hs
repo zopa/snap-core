@@ -1,16 +1,20 @@
 {-# LANGUAGE BangPatterns               #-}
+{-# LANGUAGE ConstraintKinds            #-}
 {-# LANGUAGE CPP                        #-}
 {-# LANGUAGE DeriveDataTypeable         #-}
 {-# LANGUAGE ExistentialQuantification  #-}
 {-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE FlexibleInstances          #-}
+{-# LANGUAGE UndecidableInstances       #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses      #-}
 {-# LANGUAGE OverloadedStrings          #-}
-{-# LANGUAGE Rank2Types                 #-}
+{-# LANGUAGE RankNTypes                 #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE TypeFamilies               #-}
 {-# LANGUAGE TypeSynonymInstances       #-}
+{-# LANGUAGE LambdaCase                 #-}
+{-# LANGUAGE TypeOperators              #-}
 
 module Snap.Internal.Types where
 
@@ -18,20 +22,10 @@ module Snap.Internal.Types where
 import           Blaze.ByteString.Builder
 import           Blaze.ByteString.Builder.Char.Utf8
 import           Control.Applicative
-import           Control.Exception.Lifted (catch,
-                                           catches,
-                                           mask,
-                                           onException,
-                                           throwIO,
-                                           Handler(..),
-                                           Exception,
-                                           SomeException(..),
-                                           ErrorCall(..))
+import           Control.Exception hiding (bracket)
 import           Control.Monad
 import           Control.Monad.Base
 import           Control.Monad.IO.Class
-import           Control.Monad.Trans.Control
-import           Control.Monad.Trans.State
 import           Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString.Char8 as S
 import qualified Data.ByteString.Lazy.Char8 as L
@@ -42,11 +36,11 @@ import           Data.Time
 import qualified Data.Text as T
 import qualified Data.Text.Lazy as LT
 import           Data.Typeable
-#if MIN_VERSION_base(4,6,0)
-import           Prelude hiding (take)
-#else
-import           Prelude hiding (catch, take)
-#endif
+-- #if MIN_VERSION_base(4,6,0)
+-- import           Prelude hiding (take)
+-- #else
+-- import           Prelude hiding (catch, take)
+-- #endif
 import           System.IO.Streams (InputStream, OutputStream)
 import qualified System.IO.Streams as Streams
 import           System.PosixCompat.Files hiding (setFileSize)
@@ -58,6 +52,9 @@ import           Snap.Internal.Parsing (urlDecode)
 import qualified Snap.Types.Headers as H
 import qualified Data.Readable as R
 ------------------------------------------------------------------------------
+import           Eff
+import           OpenUnion1
+import           ExtMTL
 
 
                              --------------------
@@ -143,15 +140,17 @@ transformers ('ReaderT', 'WriterT', 'StateT', etc.).
 ------------------------------------------------------------------------------
 -- | 'MonadSnap' is a type class, analogous to 'MonadIO' for 'IO', that makes
 -- it easy to wrap 'Snap' inside monad transformers.
-class (Monad m, MonadIO m, MonadBaseControl IO m, MonadPlus m, Functor m,
-       Applicative m, Alternative m) => MonadSnap m where
-    liftSnap :: Snap a -> m a
+-- class (Monad m, MonadIO m, MonadBaseControl IO m, MonadPlus m, Functor m,
+--       Applicative m, Alternative m) => MonadSnap m where
+--    liftSnap :: Snap a -> m a
 
+-- Given ExtEff, this is just a constraint alias.
+-- Note that we may need additional constraints for error handling and IO
+-- in certain places, since the new Snap has less built in.
 
 ------------------------------------------------------------------------------
-data SnapResult a = SnapValue a
-                  | Zero Zero
-
+--data SnapResult a = SnapValue a
+--                  | Zero Zero
 
 ------------------------------------------------------------------------------
 type EscapeHttpHandler =  ((Int -> Int) -> IO ())    -- ^ timeout modifier
@@ -163,27 +162,46 @@ type EscapeHttpHandler =  ((Int -> Int) -> IO ())    -- ^ timeout modifier
 ------------------------------------------------------------------------------
 data EscapeSnap = TerminateConnection SomeException
                 | EscapeHttp EscapeHttpHandler
+--                | PassOnProcessing
   deriving (Typeable)
+
+data SnapControl = EscapeSnap EscapeSnap 
+                 | EarlyTermination Response
+                 | PassOnProcessing 
+    deriving (Show, Typeable)
 
 instance Exception EscapeSnap
 
 instance Show EscapeSnap where
     show (TerminateConnection e) = "<terminated: " ++ show e ++ ">"
-    show (EscapeHttp _)          = "<escape http>"
-
-
+    show (EscapeHttp _)          = "<escape http>" 
+--    show (PassOnProcessing)      = "Pass on processing"
 ------------------------------------------------------------------------------
-data Zero = PassOnProcessing
-          | EarlyTermination Response
-          | EscapeSnap EscapeSnap
+--newtype EarlyTermination = EarlyTermination Response
 
-
+-- newtype PassOnProcessing = Pass ()
 ------------------------------------------------------------------------------
-newtype Snap a = Snap {
-      unSnap :: StateT SnapState IO (SnapResult a)
-    }
+data SnapS w = SnapS (SnapState -> SnapState) (SnapState -> w)
+    --        | Zero PassOnProcessing
+    deriving (Typeable)
 
+runSnapS :: Eff (SnapS :> r) w -> SnapState -> Eff r (w, SnapState)
+runSnapS m s = loop s (admin m)
+  where
+    loop s (Val x) = return (x,s)
+    loop s (E u)   = handle_relay u (loop s) $ \(SnapS t k) ->
+                        let s' = t s in s' `seq` loop s' (k s')
 
+sput :: Member SnapS r => SnapState -> Eff r ()
+sput s = send (\k -> inj (SnapS (const s) (\_ -> k ())))
+
+-- | Local Snap version of 'get'.
+sget :: Member SnapS r => Eff r SnapState
+sget = send (\k -> inj (SnapS id k))
+
+-- | Local Snap monad version of 'modify'.
+smodify :: Member SnapS r => (SnapState -> SnapState) -> Eff r ()
+smodify f = send (\k -> inj (SnapS f (\_ -> k ())))
 ------------------------------------------------------------------------------
 data SnapState = SnapState
     { _snapRequest       :: Request
@@ -194,108 +212,75 @@ data SnapState = SnapState
 
 
 ------------------------------------------------------------------------------
-instance Monad Snap where
-    (>>=)  = snapBind
-    return = snapReturn
-    fail   = snapFail
+--instance MonadIO Snap where
+--    liftIO m = Snap $! liftM SnapValue $! liftIO m
 
 
 ------------------------------------------------------------------------------
-snapBind :: Snap a -> (a -> Snap b) -> Snap b
-snapBind (Snap m) f = Snap $ do
-    res <- m
-
-    case res of
-      SnapValue a        -> unSnap $! f a
-      z@(Zero _)         -> return $! unsafeCoerce z
-{-# INLINE snapBind #-}
-
-
-snapReturn :: a -> Snap a
-snapReturn = Snap . return . SnapValue
-{-# INLINE snapReturn #-}
-
-
-snapFail :: String -> Snap a
-snapFail !_ = Snap $! return $! Zero PassOnProcessing
-{-# INLINE snapFail #-}
+--instance (MonadBase IO) Snap where
+--    liftBase = Snap . liftM SnapValue . liftBase
 
 
 ------------------------------------------------------------------------------
-instance MonadIO Snap where
-    liftIO m = Snap $! liftM SnapValue $! liftIO m
-
-
-------------------------------------------------------------------------------
-instance (MonadBase IO) Snap where
-    liftBase = Snap . liftM SnapValue . liftBase
-
-
-------------------------------------------------------------------------------
-instance (MonadBaseControl IO) Snap where
-    newtype StM Snap a = StSnap {
-          unStSnap :: StM (StateT SnapState IO) (SnapResult a)
-        }
-
-    liftBaseWith f = Snap $ liftM SnapValue $
-                     liftBaseWith $ \g' -> f $ \m ->
-                     liftM StSnap $ g' $ unSnap m
-    {-# INLINE liftBaseWith #-}
-
-    restoreM = Snap . restoreM . unStSnap
-    {-# INLINE restoreM #-}
-
+--instance (MonadBaseControl IO) Snap where
+--    newtype StM Snap a = StSnap {
+--           unStSnap :: StM (StateT SnapState IO) (SnapResult a)
+--         }
+-- 
+--     liftBaseWith f = Snap $ liftM SnapValue $
+--                      liftBaseWith $ \g' -> f $ \m ->
+--                      liftM StSnap $ g' $ unSnap m
+--     {-# INLINE liftBaseWith #-}
+-- 
+--     restoreM = Snap . restoreM . unStSnap
+--     {-# INLINE restoreM #-}
+-- 
 
 ------------------------------------------------------------------------------
-instance MonadPlus Snap where
-    mzero = Snap $! return $! Zero $! PassOnProcessing
+instance (Snap r) => MonadPlus (Eff r) where
+    mzero = throwError PassOnProcessing
+    --send (\_ -> inj $! Zero $! PassOnProcessing)
 
-    a `mplus` b =
-        Snap $! do
-            r <- unSnap a
-            -- redundant just in case ordering by frequency helps here.
-            case r of
-              SnapValue _           -> return r
-              Zero PassOnProcessing -> unSnap b
-              _                     -> return r
-
+    a `mplus` b = catchError a handle where
+        handle PassOnProcessing = b
+        handle e                = throwError e
 
 ------------------------------------------------------------------------------
-instance Functor Snap where
-    fmap = liftM
-
-
-------------------------------------------------------------------------------
-instance Applicative Snap where
-    pure  = return
-    (<*>) = ap
-
+instance Functor SnapS where
+    fmap f (SnapS t k)   = SnapS t (f . k)
+   -- fmap f (SnapZero z) = SnapZero z
 
 ------------------------------------------------------------------------------
-instance Alternative Snap where
+instance (Snap r) => Alternative (Eff r) where
     empty = mzero
     (<|>) = mplus
 
-
+instance (Snap r) => Applicative (Eff r) where
+    pure = return
+    (<*>) = ap
 ------------------------------------------------------------------------------
-instance MonadSnap Snap where
-    liftSnap = id
+-- A ConstraintKinds type synonym, for simpler type signatures
+-- Analogous to MonadSnap
 
+type Snap r = ( Member SnapS r
+              , Member (Exc SnapControl) r )
 
 ------------------------------------------------------------------------------
 -- | The Typeable instance is here so Snap can be dynamically executed with
 -- Hint.
-snapTyCon :: TyCon
-#if MIN_VERSION_base(4,4,0)
-snapTyCon = mkTyCon3 "snap-core" "Snap.Core" "Snap"
-#else
-snapTyCon = mkTyCon "Snap.Core.Snap"
-#endif
-{-# NOINLINE snapTyCon #-}
-
-instance Typeable1 Snap where
-    typeOf1 _ = mkTyConApp snapTyCon []
-
+--
+-- Do we need a new version of this? or is the derived version sufficient?
+-- snapTyCon :: TyCon
+-- #if MIN_VERSION_base(4,4,0)
+-- snapTyCon = mkTyCon3 "snap-core" "Snap.Core" "Snap"
+-- #else
+-- snapTyCon = mkTyCon "Snap.Core.Snap"
+-- #endif
+-- {-# NOINLINE snapTyCon #-}
+-- 
+-- instance Typeable1 Snap where
+--     typeOf1 _ = mkTyConApp snapTyCon []
+-- 
 
 ------------------------------------------------------------------------------
 -- | Pass the request body stream to a consuming procedure, returning the
@@ -308,9 +293,9 @@ instance Typeable1 Snap where
 --
 -- FIXME/TODO: reword above
 
-runRequestBody :: MonadSnap m =>
+runRequestBody :: (Snap r, MonadIO (Eff r)) =>
                   (InputStream ByteString -> IO a)
-               -> m a
+               -> Eff r a
 runRequestBody proc = do
     bumpTimeout <- liftM ($ max 5) getTimeoutModifier
     req         <- getRequest
@@ -319,12 +304,12 @@ runRequestBody proc = do
     run body
 
   where
-    skip body = liftIO (Streams.skipToEof body) `catch` tooSlow
+    skip body = (Streams.skipToEof body) `catch` tooSlow
 
     tooSlow (e :: Streams.RateTooSlowException) =
-        terminateConnection e
+        throw . TerminateConnection . SomeException $ e
 
-    run body = (liftIO $ do
+    run body = liftIO $ (do
         x <- proc body
         Streams.skipToEof body
         return x) `catches` handlers
@@ -335,12 +320,12 @@ runRequestBody proc = do
 
 ------------------------------------------------------------------------------
 -- | Returns the request body as a lazy bytestring. /New in 0.6./
-readRequestBody :: MonadSnap m =>
+readRequestBody :: (Snap r, MonadIO (Eff r)) =>
                    Int64  -- ^ size of the largest request body we're willing
                           -- to accept. If a request body longer than this is
                           -- received, a 'TooManyBytesReadException' is
                           -- thrown. See 'takeNoMoreThan'.
-                -> m L.ByteString
+                -> Eff r L.ByteString
 readRequestBody sz = liftM L.fromChunks $ runRequestBody f
   where
     f str = Streams.throwIfProducesMoreThan sz str >>= Streams.toList
@@ -359,11 +344,12 @@ readRequestBody sz = liftM L.fromChunks $ runRequestBody f
 -- if you called 'finishWith'. Make sure you set any content types, headers,
 -- cookies, etc. before you call this function.
 --
-transformRequestBody :: (InputStream ByteString -> IO (InputStream ByteString))
+transformRequestBody :: (Snap r, MonadIO (Eff r)) => 
+                        (InputStream ByteString -> IO (InputStream ByteString))
                          -- ^ the 'InputStream' from the 'Request' is passed to
                          -- this function, and then the resulting 'InputStream'
                          -- is fed to the output.
-                     -> Snap ()
+                     -> Eff r ()
 transformRequestBody trans = do
     req     <- getRequest
     is      <- liftIO ((trans $ rqBody req) >>=
@@ -377,8 +363,8 @@ transformRequestBody trans = do
 ------------------------------------------------------------------------------
 -- | Short-circuits a 'Snap' monad action early, storing the given
 -- 'Response' value in its state.
-finishWith :: MonadSnap m => Response -> m a
-finishWith = liftSnap . Snap . return . Zero . EarlyTermination
+finishWith :: Snap r => Response -> Eff r a
+finishWith resp = throwError $ EarlyTermination resp
 {-# INLINE finishWith #-}
 
 
@@ -389,13 +375,10 @@ finishWith = liftSnap . Snap . return . Zero . EarlyTermination
 -- to violate HTTP protocol safety when using this function. If you call
 -- 'catchFinishWith' it is suggested that you do not modify the body of the
 -- 'Response' which was passed to the 'finishWith' call.
-catchFinishWith :: Snap a -> Snap (Either Response a)
-catchFinishWith (Snap m) = Snap $ do
-    r <- m
-    case r of
-      SnapValue a                    -> return $! SnapValue $! Right a
-      (Zero (EarlyTermination resp)) -> return $! SnapValue $! Left resp
-      (Zero _)                       -> return $ unsafeCoerce r
+catchFinishWith :: Snap r => Eff r a -> Eff r (Either Response a)
+catchFinishWith = flip catchError finish . fmap Right
+  where
+    finish (EarlyTermination resp) = return $ Left resp
 {-# INLINE catchFinishWith #-}
 
 
@@ -403,14 +386,14 @@ catchFinishWith (Snap m) = Snap $ do
 -- | Fails out of a 'Snap' monad action.  This is used to indicate
 -- that you choose not to handle the given request within the given
 -- handler.
-pass :: MonadSnap m => m a
+pass :: Snap r => Eff r a
 pass = empty
 
 
 ------------------------------------------------------------------------------
 -- | Runs a 'Snap' monad action only if the request's HTTP method matches
 -- the given method.
-method :: MonadSnap m => Method -> m a -> m a
+method :: Snap r => Method -> Eff r a -> Eff r a
 method m action = do
     req <- getRequest
     unless (rqMethod req == m) pass
@@ -421,7 +404,7 @@ method m action = do
 ------------------------------------------------------------------------------
 -- | Runs a 'Snap' monad action only if the request's HTTP method matches
 -- one of the given methods.
-methods :: MonadSnap m => [Method] -> m a -> m a
+methods :: Snap r => [Method] -> Eff r a -> Eff r a
 methods ms action = do
     req <- getRequest
     unless (rqMethod req `elem` ms) pass
@@ -445,11 +428,11 @@ updateContextPath n req | n > 0     = req { rqContextPath = ctx
 ------------------------------------------------------------------------------
 -- Runs a 'Snap' monad action only if the 'rqPathInfo' matches the given
 -- predicate.
-pathWith :: MonadSnap m
+pathWith :: Snap r
          => (ByteString -> ByteString -> Bool)
          -> ByteString
-         -> m a
-         -> m a
+         -> Eff r a
+         -> Eff r a
 pathWith c p action = do
     req <- getRequest
     unless (c p (rqPathInfo req)) pass
@@ -464,10 +447,10 @@ pathWith c p action = do
 --
 -- Will fail if 'rqPathInfo' is not \"@\/foo@\" or \"@\/foo\/...@\", and will
 -- add @\"foo\/\"@ to the handler's local 'rqContextPath'.
-dir :: MonadSnap m
+dir :: Snap r
     => ByteString  -- ^ path component to match
-    -> m a         -- ^ handler to run
-    -> m a
+    -> Eff r a         -- ^ handler to run
+    -> Eff r a
 dir = pathWith f
   where
     f dr pinfo = dr == x
@@ -481,10 +464,10 @@ dir = pathWith f
 -- exactly equal to the given string. If the path matches, locally sets
 -- 'rqContextPath' to the old value of 'rqPathInfo', sets 'rqPathInfo'=\"\",
 -- and runs the given handler.
-path :: MonadSnap m
+path :: Snap r
      => ByteString  -- ^ path to match against
-     -> m a         -- ^ handler to run
-     -> m a
+     -> Eff r a         -- ^ handler to run
+     -> Eff r a
 path = pathWith (==)
 {-# INLINE path #-}
 
@@ -495,9 +478,9 @@ path = pathWith (==)
 --
 -- Note that the path segment is url-decoded prior to being passed to 'fromBS';
 -- this is new as of snap-core 0.10.
-pathArg :: (R.Readable a, MonadSnap m)
-        => (a -> m b)
-        -> m b
+pathArg :: (R.Readable a, Snap r)
+        => (a -> Eff r b)
+        -> Eff r b
 pathArg f = do
     req <- getRequest
     let (p,_) = S.break (=='/') (rqPathInfo req)
@@ -508,81 +491,65 @@ pathArg f = do
 
 ------------------------------------------------------------------------------
 -- | Runs a 'Snap' monad action only when 'rqPathInfo' is empty.
-ifTop :: MonadSnap m => m a -> m a
+ifTop :: Snap r => Eff r a -> Eff r a
 ifTop = path ""
 {-# INLINE ifTop #-}
 
-
-------------------------------------------------------------------------------
--- | Local Snap version of 'get'.
-sget :: Snap SnapState
-sget = Snap $ liftM SnapValue get
-{-# INLINE sget #-}
-
-
-------------------------------------------------------------------------------
--- | Local Snap monad version of 'modify'.
-smodify :: (SnapState -> SnapState) -> Snap ()
-smodify f = Snap $ modify f >> return (SnapValue ())
-{-# INLINE smodify #-}
-
-
 ------------------------------------------------------------------------------
 -- | Grabs the 'Request' object out of the 'Snap' monad.
-getRequest :: MonadSnap m => m Request
-getRequest = liftSnap $ liftM _snapRequest sget
+getRequest :: Snap r => Eff r Request
+getRequest = liftM _snapRequest sget
 {-# INLINE getRequest #-}
 
 
 ------------------------------------------------------------------------------
 -- | Grabs something out of the 'Request' object, using the given projection
 -- function. See 'gets'.
-getsRequest :: MonadSnap m => (Request -> a) -> m a
-getsRequest f = liftSnap $ liftM (f . _snapRequest) sget
+getsRequest :: Snap r => (Request -> a) -> Eff r a
+getsRequest f = liftM (f . _snapRequest) sget
 {-# INLINE getsRequest #-}
 
 
 ------------------------------------------------------------------------------
 -- | Grabs the 'Response' object out of the 'Snap' monad.
-getResponse :: MonadSnap m => m Response
-getResponse = liftSnap $ liftM _snapResponse sget
+getResponse :: Snap r => Eff r Response
+getResponse = liftM _snapResponse sget
 {-# INLINE getResponse #-}
 
 
 ------------------------------------------------------------------------------
 -- | Grabs something out of the 'Response' object, using the given projection
 -- function. See 'gets'.
-getsResponse :: MonadSnap m => (Response -> a) -> m a
-getsResponse f = liftSnap $ liftM (f . _snapResponse) sget
+getsResponse :: Snap r => (Response -> a) -> Eff r a
+getsResponse f = liftM (f . _snapResponse) sget
 {-# INLINE getsResponse #-}
 
 
 ------------------------------------------------------------------------------
 -- | Puts a new 'Response' object into the 'Snap' monad.
-putResponse :: MonadSnap m => Response -> m ()
-putResponse r = liftSnap $ smodify $ \ss -> ss { _snapResponse = r }
+putResponse :: Snap r => Response -> Eff r ()
+putResponse r = smodify $ \ss -> ss { _snapResponse = r }
 {-# INLINE putResponse #-}
 
 
 ------------------------------------------------------------------------------
 -- | Puts a new 'Request' object into the 'Snap' monad.
-putRequest :: MonadSnap m => Request -> m ()
-putRequest r = liftSnap $ smodify $ \ss -> ss { _snapRequest = r }
+putRequest :: Snap r => Request -> Eff r ()
+putRequest r = smodify $ \ss -> ss { _snapRequest = r }
 {-# INLINE putRequest #-}
 
 
 ------------------------------------------------------------------------------
 -- | Modifies the 'Request' object stored in a 'Snap' monad.
-modifyRequest :: MonadSnap m => (Request -> Request) -> m ()
-modifyRequest f = liftSnap $
-    smodify $ \ss -> ss { _snapRequest = f $ _snapRequest ss }
+modifyRequest :: Snap r => (Request -> Request) -> Eff r ()
+modifyRequest f = smodify $ \ss -> ss { _snapRequest = f $ _snapRequest ss }
 {-# INLINE modifyRequest #-}
 
 
 ------------------------------------------------------------------------------
 -- | Modifes the 'Response' object stored in a 'Snap' monad.
-modifyResponse :: MonadSnap m => (Response -> Response) -> m ()
-modifyResponse f = liftSnap $
+modifyResponse :: Snap r => (Response -> Response) -> Eff r ()
+modifyResponse f = 
      smodify $ \ss -> ss { _snapResponse = f $ _snapResponse ss }
 {-# INLINE modifyResponse #-}
 
@@ -593,7 +560,7 @@ modifyResponse f = liftSnap $
 -- 'Snap' monad. Note that the target URL is not validated in any way.
 -- Consider using 'redirect\'' instead, which allows you to choose the correct
 -- status code.
-redirect :: MonadSnap m => ByteString -> m a
+redirect :: Snap r => ByteString -> Eff r a
 redirect target = redirect' target 302
 {-# INLINE redirect #-}
 
@@ -603,7 +570,7 @@ redirect target = redirect' target 302
 -- URL/path and the status code (should be one of 301, 302, 303 or 307) in the
 -- 'Response' object stored in a 'Snap' monad. Note that the target URL is not
 -- validated in any way.
-redirect' :: MonadSnap m => ByteString -> Int -> m a
+redirect' :: Snap r => ByteString -> Int -> Eff r a
 redirect' target status = do
     r <- getResponse
 
@@ -618,19 +585,18 @@ redirect' target status = do
 
 ------------------------------------------------------------------------------
 -- | Log an error message in the 'Snap' monad
-logError :: MonadSnap m => ByteString -> m ()
-logError s = liftSnap $ Snap $ gets _snapLogError >>= (\l -> liftIO $ l s)
-                                       >>  return (SnapValue $! ())
+logError :: (Snap r, MonadIO (Eff r)) => ByteString -> Eff r ()
+logError s = liftM _snapLogError sget >>= (\l -> liftIO $ l s)
 {-# INLINE logError #-}
 
 
 ------------------------------------------------------------------------------
 -- | Adds the output from the given enumerator to the 'Response'
 -- stored in the 'Snap' monad state.
-addToOutput :: MonadSnap m
+addToOutput :: Snap r
             => (OutputStream Builder -> IO (OutputStream Builder))
                     -- ^ output to add
-            -> m ()
+            -> Eff r ()
 addToOutput enum = modifyResponse $ modifyResponseBody (c enum)
   where
     c a b = \out -> b out >>= a
@@ -638,7 +604,7 @@ addToOutput enum = modifyResponse $ modifyResponseBody (c enum)
 ------------------------------------------------------------------------------
 -- | Adds the given 'Builder' to the body of the 'Response' stored in the
 -- | 'Snap' monad state.
-writeBuilder :: MonadSnap m => Builder -> m ()
+writeBuilder :: Snap r => Builder -> Eff r ()
 writeBuilder b = addToOutput f
   where
     f str = Streams.write (Just b) str >> return str
@@ -652,7 +618,7 @@ writeBuilder b = addToOutput f
 -- Warning: This function is intentionally non-strict. If any pure
 -- exceptions are raised by the expression creating the 'ByteString',
 -- the exception won't actually be raised within the Snap handler.
-writeBS :: MonadSnap m => ByteString -> m ()
+writeBS :: Snap r => ByteString -> Eff r ()
 writeBS s = writeBuilder $ fromByteString s
 
 
@@ -663,7 +629,7 @@ writeBS s = writeBuilder $ fromByteString s
 -- Warning: This function is intentionally non-strict. If any pure
 -- exceptions are raised by the expression creating the 'ByteString',
 -- the exception won't actually be raised within the Snap handler.
-writeLBS :: MonadSnap m => L.ByteString -> m ()
+writeLBS :: Snap r => L.ByteString -> Eff r ()
 writeLBS s = writeBuilder $ fromLazyByteString s
 
 
@@ -674,7 +640,7 @@ writeLBS s = writeBuilder $ fromLazyByteString s
 -- Warning: This function is intentionally non-strict. If any pure
 -- exceptions are raised by the expression creating the 'ByteString',
 -- the exception won't actually be raised within the Snap handler.
-writeText :: MonadSnap m => T.Text -> m ()
+writeText :: Snap r => T.Text -> Eff r ()
 writeText s = writeBuilder $ fromText s
 
 
@@ -685,7 +651,7 @@ writeText s = writeBuilder $ fromText s
 -- Warning: This function is intentionally non-strict. If any pure
 -- exceptions are raised by the expression creating the 'ByteString',
 -- the exception won't actually be raised within the Snap handler.
-writeLazyText :: MonadSnap m => LT.Text -> m ()
+writeLazyText :: Snap r => LT.Text -> Eff r ()
 writeLazyText s = writeBuilder $ fromLazyText s
 
 
@@ -699,7 +665,7 @@ writeLazyText s = writeBuilder $ fromLazyText s
 --
 -- If the response body is modified (using 'modifyResponseBody'), the file
 -- will be read using @mmap()@.
-sendFile :: (MonadSnap m) => FilePath -> m ()
+sendFile :: Snap r => FilePath -> Eff r ()
 sendFile f = modifyResponse $ \r -> r { rspBody = SendFile f Nothing }
 
 
@@ -714,7 +680,7 @@ sendFile f = modifyResponse $ \r -> r { rspBody = SendFile f Nothing }
 --
 -- If the response body is modified (using 'modifyResponseBody'), the file
 -- will be read using @mmap()@.
-sendFilePartial :: (MonadSnap m) => FilePath -> (Int64,Int64) -> m ()
+sendFilePartial :: Snap r  => FilePath -> (Int64,Int64) -> Eff r ()
 sendFilePartial f rng = modifyResponse $ \r ->
                         r { rspBody = SendFile f (Just rng) }
 
@@ -723,7 +689,7 @@ sendFilePartial f rng = modifyResponse $ \r ->
 -- | Runs a 'Snap' action with a locally-modified 'Request' state
 -- object. The 'Request' object in the Snap monad state after the call
 -- to localRequest will be unchanged.
-localRequest :: MonadSnap m => (Request -> Request) -> m a -> m a
+localRequest :: Snap r => (Request -> Request) -> Eff r a -> Eff r a
 localRequest f m = do
     req <- getRequest
 
@@ -740,14 +706,14 @@ localRequest f m = do
 
 ------------------------------------------------------------------------------
 -- | Fetches the 'Request' from state and hands it to the given action.
-withRequest :: MonadSnap m => (Request -> m a) -> m a
+withRequest :: Snap r => (Request -> Eff r a) -> Eff r a
 withRequest = (getRequest >>=)
 {-# INLINE withRequest #-}
 
 
 ------------------------------------------------------------------------------
 -- | Fetches the 'Response' from state and hands it to the given action.
-withResponse :: MonadSnap m => (Response -> m a) -> m a
+withResponse :: Snap r => (Response -> Eff r a) -> Eff r a
 withResponse = (getResponse >>=)
 {-# INLINE withResponse #-}
 
@@ -765,7 +731,7 @@ withResponse = (getResponse >>=)
 -- address can get it in a uniform manner. It has specifically limited
 -- functionality to ensure that its transformation can be trusted,
 -- when used correctly.
-ipHeaderFilter :: MonadSnap m => m ()
+ipHeaderFilter :: Snap r => Eff r ()
 ipHeaderFilter = ipHeaderFilter' "x-forwarded-for"
 
 
@@ -782,7 +748,7 @@ ipHeaderFilter = ipHeaderFilter' "x-forwarded-for"
 -- address can get it in a uniform manner. It has specifically limited
 -- functionality to ensure that its transformation can be trusted,
 -- when used correctly.
-ipHeaderFilter' :: MonadSnap m => CI ByteString -> m ()
+ipHeaderFilter' :: Snap r => CI ByteString -> Eff r ()
 ipHeaderFilter' header = do
     headerContents <- getHeader header <$> getRequest
 
@@ -814,14 +780,20 @@ ipHeaderFilter' header = do
 -- 2. Short-circuit completion, either from calling 'fail' or 'finishWith'
 --
 -- 3. An exception being thrown.
-bracketSnap :: IO a -> (a -> IO b) -> (a -> Snap c) -> Snap c
-bracketSnap before after thing = mask $ \restore -> Snap $ do
-    a <- liftIO before
-    let after' = liftIO $ after a
-    r <- unSnap (restore $ thing a) `onException` after'
-    _ <- after'
-    return r
+-- bracketSnapOld :: IO a -> (a -> IO b) -> (a -> Snap c) -> Snap c
+-- bracketSnapOld before after thing = mask $ \restore -> Snap $ do
+--     a <- liftIO before
+--     let after' = liftIO $ after a
+--     r <- unSnap (restore $ thing a) `onException` after'
+--     _ <- after'
+--     return r
 
+-- Not yet asynchronous-excetion-safe
+bracketSnap :: ( Snap r
+               , MemberU2 Lift (Lift IO) r
+               , Member Bracket r ) => 
+               IO a -> (a -> IO b) -> (a -> Eff r c) -> Eff r c
+bracketSnap before after thing = bracket before after thing
 
 ------------------------------------------------------------------------------
 -- | This exception is thrown if the handler you supply to 'runSnap' fails.
@@ -840,10 +812,9 @@ instance Exception NoHandlerException
 
 ------------------------------------------------------------------------------
 -- | Terminate the HTTP session with the given exception.
-terminateConnection :: (Exception e, MonadSnap m) => e -> m a
+terminateConnection :: (Exception e, Snap r) => e -> Eff r a
 terminateConnection =
-    liftSnap . Snap . return . Zero . EscapeSnap . TerminateConnection
-             . SomeException
+    throwError . EscapeSnap . TerminateConnection . SomeException
 
 
 ------------------------------------------------------------------------------
@@ -852,35 +823,45 @@ terminateConnection =
 --
 -- The external handler takes two arguments: a function to modify the thread's
 -- timeout, and a write end to the socket.
-escapeHttp :: MonadSnap m =>
+escapeHttp :: Snap r =>
               EscapeHttpHandler
-           -> m ()
-escapeHttp = liftSnap . Snap . return . Zero . EscapeSnap . EscapeHttp
+           -> Eff r ()
+escapeHttp = throwError . EscapeSnap . EscapeHttp
 
+-- BD: Start here
 
 ------------------------------------------------------------------------------
 -- | Runs a 'Snap' monad action.
-runSnap :: Snap a
+runSnap :: Eff (Exc SnapControl :> SnapS :> Bracket :> Lift IO :> Void) a
         -> (ByteString -> IO ())
         -> ((Int -> Int) -> IO ())
         -> Request
         -> IO (Request, Response)
-runSnap (Snap m) logerr timeoutAction req = do
-    (r, ss') <- runStateT m ss
-
-    resp <- case r of
-              SnapValue _               -> return $ _snapResponse ss'
-              Zero PassOnProcessing     -> return $ fourohfour
-              Zero (EarlyTermination x) -> return $ x
-              Zero (EscapeSnap e)       -> throwIO e
-
-    let req' = _snapRequest ss'
-
-    resp' <- liftIO $ fixupResponse req' resp
-
-    return (req', resp')
-
+runSnap m logerr timeoutAction req = runLift
+                                   . finalize
+                                   . runBracket
+                                   . flip runSnapS ss
+                                   $ (runError m >>= handleSC)
   where
+    handleSC (Right _ )                  = return ()
+    handleSC (Left PassOnProcessing)     = putResponse' fourohfour
+    handleSC (Left (EarlyTermination r)) = putResponse' r
+    handleSC (Left (EscapeSnap e))       = throw e
+
+
+    finalize :: Eff (Lift IO :> Void) (a, SnapState)
+             -> Eff (Lift IO :> Void) (Request, Response)
+    finalize m = do
+        (_, ss') <- m
+        let req  = _snapRequest ss'
+            resp = _snapResponse ss'
+        resp' <- liftIO $ fixupResponse req resp
+        return (req, resp')
+
+    -- We need a more general version here, because we've already
+    -- removed the SnapControl layer.
+    putResponse' r = smodify $ \s -> s { _snapResponse = r }
+
     --------------------------------------------------------------------------
     fourohfour = do
         clearContentLength                  $
@@ -971,31 +952,31 @@ fixupResponse req rsp = {-# SCC "fixupResponse" #-} do
 
 
 ------------------------------------------------------------------------------
-evalSnap :: Snap a
+evalSnap :: Eff (Exc SnapControl :> SnapS :> Bracket :> Lift IO :> Void) a
          -> (ByteString -> IO ())
          -> ((Int -> Int) -> IO ())
          -> Request
          -> IO a
-evalSnap (Snap m) logerr timeoutAction req = do
-    (r, _) <- runStateT m ss
-
-    case r of
-      SnapValue x               -> return x
-      Zero PassOnProcessing     -> throwIO $ NoHandlerException "pass"
-      Zero (EarlyTermination _) -> throwIO $ ErrorCall "no value"
-      Zero (EscapeSnap e)       -> throwIO e
+evalSnap m logerr timeoutAction req = fmap fst . runLift . runBracket
+                                    . flip runSnapS ss
+                                    $ (runError m >>= handleSC)
 
   where
+    handleSC (Right v )                  = return v
+    handleSC (Left PassOnProcessing)     = throw $ NoHandlerException "pass"
+    handleSC (Left (EscapeSnap e))       = throw e
+    handleSC (Left (EarlyTermination r)) = throw $ ErrorCall "no value"
+
     dresp = emptyResponse { rspHttpVersion = rqVersion req }
     ss = SnapState req dresp logerr timeoutAction
 {-# INLINE evalSnap #-}
 
 
 ------------------------------------------------------------------------------
-getParamFrom :: MonadSnap m =>
+getParamFrom :: Snap r =>
                 (ByteString -> Request -> Maybe [ByteString])
              -> ByteString
-             -> m (Maybe ByteString)
+             -> Eff r (Maybe ByteString)
 getParamFrom f k = do
     rq <- getRequest
     return $! liftM (S.intercalate " ") $ f k rq
@@ -1009,9 +990,9 @@ getParamFrom f k = do
 --
 -- @    'S.intercalate' \" \"@
 --
-getParam :: MonadSnap m
+getParam :: Snap r
          => ByteString          -- ^ parameter name to look up
-         -> m (Maybe ByteString)
+         -> Eff r (Maybe ByteString)
 getParam = getParamFrom rqParam
 {-# INLINE getParam #-}
 
@@ -1024,9 +1005,9 @@ getParam = getParamFrom rqParam
 --
 -- @    'S.intercalate' \" \"@
 --
-getPostParam :: MonadSnap m
+getPostParam :: Snap r
              => ByteString          -- ^ parameter name to look up
-             -> m (Maybe ByteString)
+             -> Eff r (Maybe ByteString)
 getPostParam = getParamFrom rqPostParam
 {-# INLINE getPostParam #-}
 
@@ -1039,9 +1020,9 @@ getPostParam = getParamFrom rqPostParam
 --
 -- @    'S.intercalate' \" \"@
 --
-getQueryParam :: MonadSnap m
+getQueryParam :: Snap r
               => ByteString          -- ^ parameter name to look up
-              -> m (Maybe ByteString)
+              -> Eff r (Maybe ByteString)
 getQueryParam = getParamFrom rqQueryParam
 {-# INLINE getQueryParam #-}
 
@@ -1049,29 +1030,29 @@ getQueryParam = getParamFrom rqQueryParam
 ------------------------------------------------------------------------------
 -- | See 'rqParams'. Convenience function to return 'Params' from the
 -- 'Request' inside of a 'MonadSnap' instance.
-getParams :: MonadSnap m => m Params
+getParams :: Snap r => Eff r Params
 getParams = getRequest >>= return . rqParams
 
 
 ------------------------------------------------------------------------------
 -- | See 'rqParams'. Convenience function to return 'Params' from the
 -- 'Request' inside of a 'MonadSnap' instance.
-getPostParams :: MonadSnap m => m Params
+getPostParams :: Snap r => Eff r Params
 getPostParams = getRequest >>= return . rqPostParams
 
 
 ------------------------------------------------------------------------------
 -- | See 'rqParams'. Convenience function to return 'Params' from the
 -- 'Request' inside of a 'MonadSnap' instance.
-getQueryParams :: MonadSnap m => m Params
+getQueryParams :: Snap r => Eff r Params
 getQueryParams = getRequest >>= return . rqQueryParams
 
 
 ------------------------------------------------------------------------------
 -- | Gets the HTTP 'Cookie' with the specified name.
-getCookie :: MonadSnap m
+getCookie :: Snap r
           => ByteString
-          -> m (Maybe Cookie)
+          -> Eff r (Maybe Cookie)
 getCookie name = withRequest $
     return . listToMaybe . filter (\c -> cookieName c == name) . rqCookies
 
@@ -1079,20 +1060,20 @@ getCookie name = withRequest $
 ------------------------------------------------------------------------------
 -- | Gets the HTTP 'Cookie' with the specified name and decodes it.  If the
 -- decoding fails, the handler calls pass.
-readCookie :: (MonadSnap m, R.Readable a)
+readCookie :: (Snap r, R.Readable a)
            => ByteString
-           -> m a
+           -> Eff r a
 readCookie name = maybe pass (R.fromBS . cookieValue) =<< getCookie name
 
 
 ------------------------------------------------------------------------------
 -- | Expire the given 'Cookie' in client's browser.
-expireCookie :: (MonadSnap m)
+expireCookie :: (Snap r)
              => ByteString
              -- ^ Cookie name
              -> Maybe ByteString
              -- ^ Cookie domain
-             -> m ()
+             -> Eff r ()
 expireCookie nm dm = do
   let old = UTCTime (ModifiedJulianDay 0) 0
   modifyResponse $ addResponseCookie
@@ -1101,19 +1082,19 @@ expireCookie nm dm = do
 
 ------------------------------------------------------------------------------
 -- | Causes the handler thread to be killed @n@ seconds from now.
-setTimeout :: MonadSnap m => Int -> m ()
+setTimeout :: (Snap r, MonadIO (Eff r)) => Int -> Eff r ()
 setTimeout = modifyTimeout . const
 
 
 ------------------------------------------------------------------------------
 -- | Causes the handler thread to be killed at least @n@ seconds from now.
-extendTimeout :: MonadSnap m => Int -> m ()
+extendTimeout :: (Snap r, MonadIO (Eff r)) => Int -> Eff r ()
 extendTimeout = modifyTimeout . max
 
 
 ------------------------------------------------------------------------------
 -- | Modifies the amount of time remaining before the request times out.
-modifyTimeout :: MonadSnap m => (Int -> Int) -> m ()
+modifyTimeout :: (Snap r, MonadIO (Eff r)) => (Int -> Int) -> Eff r ()
 modifyTimeout f = do
     m <- getTimeoutModifier
     liftIO $ m f
@@ -1121,5 +1102,5 @@ modifyTimeout f = do
 
 ------------------------------------------------------------------------------
 -- | Returns an 'IO' action which you can use to modify the timeout value.
-getTimeoutModifier :: MonadSnap m => m ((Int -> Int) -> IO ())
-getTimeoutModifier = liftSnap $ liftM _snapModifyTimeout sget
+getTimeoutModifier :: Snap r => Eff r ((Int -> Int) -> IO ())
+getTimeoutModifier = liftM _snapModifyTimeout sget

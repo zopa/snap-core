@@ -29,6 +29,8 @@ import           System.Environment
 import           System.IO
 import           System.IO.Unsafe
 import           Text.Printf
+
+import           ExtMTL
 #endif
 ------------------------------------------------------------------------------
 

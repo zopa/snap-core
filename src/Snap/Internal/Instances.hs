@@ -22,7 +22,9 @@ import           Prelude                     hiding (catch)
 ------------------------------------------------------------------------------
 import           Snap.Internal.Types
 
+-- These instances are deprecated with an ExtEff approach.
 
+{-
 ------------------------------------------------------------------------------
 instance (MonadSnap m, Error e) => MonadSnap (ErrorT e m) where
     liftSnap = lift . liftSnap
@@ -66,3 +68,4 @@ instance (MonadSnap m, Monoid w) => MonadSnap (WriterT w m) where
 ------------------------------------------------------------------------------
 instance (MonadSnap m, Monoid w) => MonadSnap (LWriter.WriterT w m) where
     liftSnap = lift . liftSnap
+-}

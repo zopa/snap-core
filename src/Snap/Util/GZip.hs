@@ -1,3 +1,4 @@
+{-# LANGUAGE ConstraintKinds           #-}
 {-# LANGUAGE CPP                       #-}
 {-# LANGUAGE DeriveDataTypeable        #-}
 {-# LANGUAGE ExistentialQuantification #-}
@@ -32,6 +33,9 @@ import           Prelude                  hiding (catch, read, takeWhile)
 #endif
 import           System.IO.Streams        (OutputStream)
 import qualified System.IO.Streams        as Streams
+
+import           Eff
+import           OpenUnion1
 ----------------------------------------------------------------------------
 import           Snap.Core
 import           Snap.Internal.Debug
@@ -70,21 +74,21 @@ import           Snap.Internal.Parsing
 -- that's contained within the 'Snap' monad state will be passed to
 -- 'finishWith' to prevent further processing.
 --
-withCompression :: MonadSnap m
-                => m a   -- ^ the web handler to run
-                -> m ()
+withCompression :: (Snap r, MemberU2 Lift (Lift IO) r)
+                => Eff r a   -- ^ the web handler to run
+                -> Eff r ()
 withCompression = withCompression' compressibleMimeTypes
 
 
 ------------------------------------------------------------------------------
 -- | The same as 'withCompression', with control over which MIME types to
 -- compress.
-withCompression' :: MonadSnap m
+withCompression' :: (Snap r, MemberU2 Lift (Lift IO) r)
                  => Set ByteString
                     -- ^ set of compressible MIME types
-                 -> m a
+                 -> Eff r a
                     -- ^ the web handler to run
-                 -> m ()
+                 -> Eff r ()
 withCompression' mimeTable action = do
     _    <- action
     resp <- getResponse
@@ -131,7 +135,7 @@ withCompression' mimeTable action = do
 ------------------------------------------------------------------------------
 -- | Turn off compression by setting \"Content-Encoding: identity\" in the
 -- response headers.
-noCompression :: MonadSnap m => m ()
+noCompression :: Snap r => Eff r ()
 noCompression = modifyResponse $ setHeader "Content-Encoding" "identity"
 
 
@@ -155,7 +159,7 @@ compressibleMimeTypes = Set.fromList [ "application/x-font-truetype"
 
 
 ------------------------------------------------------------------------------
-gzipCompression :: MonadSnap m => ByteString -> m ()
+gzipCompression :: Snap r => ByteString -> Eff r ()
 gzipCompression ce = modifyResponse f
   where
     f r = setHeader "Content-Encoding" ce    $
@@ -165,7 +169,7 @@ gzipCompression ce = modifyResponse f
 
 
 ------------------------------------------------------------------------------
-compressCompression :: MonadSnap m => ByteString -> m ()
+compressCompression :: Snap r => ByteString -> Eff r ()
 compressCompression ce = modifyResponse f
   where
     f r = setHeader "Content-Encoding" ce    $

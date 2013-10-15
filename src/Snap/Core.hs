@@ -9,7 +9,6 @@ module Snap.Core
     -- * The Snap Monad
     Snap
   , runSnap
-  , MonadSnap(..)
   , NoHandlerException(..)
 
     -- ** Functions for control flow and early termination

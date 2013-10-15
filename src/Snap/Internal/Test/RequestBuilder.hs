@@ -4,6 +4,8 @@
 {-# LANGUAGE Rank2Types                 #-}
 
 module Snap.Internal.Test.RequestBuilder
+  () where
+{-
   ( RequestBuilder
   , MultipartParams
   , MultipartParam(..)
@@ -35,13 +37,14 @@ module Snap.Internal.Test.RequestBuilder
   , setSecure
   ) where
 
+-}
 ------------------------------------------------------------------------------
 import           Blaze.ByteString.Builder
 import           Blaze.ByteString.Builder.Char8
 import           Control.Applicative            (Applicative)
 import           Control.Monad
-import           Control.Monad.State.Strict     hiding (get, put)
-import qualified Control.Monad.State.Strict     as State
+--import           Control.Monad.State.Strict     hiding (get, put)
+--import qualified Control.Monad.State.Strict     as State
 import           Data.Bits
 import qualified Data.ByteString                as S8
 import           Data.ByteString.Char8          (ByteString)
@@ -68,6 +71,11 @@ import qualified Snap.Types.Headers             as H
 ------------------------------------------------------------------------------
 -- | RequestBuilder is a monad transformer that allows you to conveniently
 -- build a snap 'Request' for testing.
+
+{-
+-- Large parts of RequestBuilder use MTL. Hide it for now until we get
+-- the core code changed over.
+
 newtype RequestBuilder m a = RequestBuilder (StateT Request m a)
   deriving ( Applicative
            , Functor
@@ -748,3 +756,4 @@ rPut s = RequestBuilder $ State.put s
 
 rModify :: Monad m => (Request -> Request) -> RequestBuilder m ()
 rModify f = RequestBuilder $ modify f
+-}

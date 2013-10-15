@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns        #-}
+{-# LANGUAGE ConstraintKinds     #-}
 {-# LANGUAGE CPP                 #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -29,7 +30,7 @@ module Snap.Internal.Util.FileServe
 import           Blaze.ByteString.Builder
 import           Blaze.ByteString.Builder.Char8
 import           Control.Applicative
-import           Control.Exception.Lifted       (SomeException, catch, evaluate)
+import           Control.Exception
 import           Control.Monad
 import           Control.Monad.IO.Class
 import           Data.Attoparsec.Char8
@@ -44,6 +45,9 @@ import           Data.Maybe                     (fromMaybe, isNothing)
 import           Data.Monoid
 import qualified Data.Text                      as T
 import qualified Data.Text.Encoding             as T
+import           Eff
+import           ExtMTL
+import           OpenUnion1
 #if MIN_VERSION_base(4,6,0)
 import           Prelude                        hiding (Show, show)
 #else
@@ -63,7 +67,7 @@ import           Snap.Internal.Parsing
 -- | Gets a path from the 'Request' using 'rqPathInfo' and makes sure it is
 -- safe to use for opening files.  A path is safe if it is a relative path
 -- and has no ".." elements to escape the intended directory structure.
-getSafePath :: MonadSnap m => m FilePath
+getSafePath :: Snap r => Eff r FilePath
 getSafePath = do
     req <- getRequest
     let mp = urlDecode $ rqPathInfo req
@@ -363,11 +367,11 @@ snapIndexStyles =
 -- The listing itself consists of a table, containing a header row using
 -- th elements, and one row per file using td elements, so styles for those
 -- pieces may be attached to the appropriate tags.
-defaultIndexGenerator :: MonadSnap m
+defaultIndexGenerator :: (Snap r, MonadIO (Eff r))
                       => MimeMap    -- ^ MIME type mapping for reporting types
                       -> ByteString -- ^ Style info to insert in header
                       -> FilePath   -- ^ Directory to generate index for
-                      -> m ()
+                      -> Eff r ()
 defaultIndexGenerator mm styles d = do
     modifyResponse $ setContentType "text/html; charset=utf-8"
     rq      <- getRequest
@@ -435,7 +439,7 @@ decodeFilePath fp = do
 -- | A very simple configuration for directory serving.  This configuration
 -- uses built-in MIME types from 'defaultMimeTypes', and has no index files,
 -- index generator, dynamic file handlers, or 'preServeHook'.
-simpleDirectoryConfig :: MonadSnap m => DirectoryConfig m
+simpleDirectoryConfig :: Snap r => DirectoryConfig (Eff r)
 simpleDirectoryConfig = DirectoryConfig {
     indexFiles      = [],
     indexGenerator  = const pass,
@@ -451,7 +455,7 @@ simpleDirectoryConfig = DirectoryConfig {
 -- common index files @index.html@ and @index.htm@, but does not autogenerate
 -- directory indexes, nor have any dynamic file handlers. The 'preServeHook'
 -- will not do anything.
-defaultDirectoryConfig :: MonadSnap m => DirectoryConfig m
+defaultDirectoryConfig :: Snap r => DirectoryConfig (Eff r)
 defaultDirectoryConfig = DirectoryConfig {
     indexFiles      = ["index.html", "index.htm"],
     indexGenerator  = const pass,
@@ -470,7 +474,7 @@ defaultDirectoryConfig = DirectoryConfig {
 --
 -- Files recognized as indexes include @index.html@, @index.htm@,
 -- @default.html@, @default.htm@, @home.html@
-fancyDirectoryConfig :: MonadSnap m => DirectoryConfig m
+fancyDirectoryConfig :: (Snap r, MonadIO (Eff r)) => DirectoryConfig (Eff r)
 fancyDirectoryConfig = DirectoryConfig {
     indexFiles      = ["index.html", "index.htm"],
     indexGenerator  = defaultIndexGenerator defaultMimeTypes snapIndexStyles,
@@ -483,9 +487,9 @@ fancyDirectoryConfig = DirectoryConfig {
 ------------------------------------------------------------------------------
 -- | Serves static files from a directory using the default configuration
 -- as given in 'defaultDirectoryConfig'.
-serveDirectory :: MonadSnap m
+serveDirectory :: (Snap r, MemberU2 Lift (Lift IO) r)
                => FilePath           -- ^ Directory to serve from
-               -> m ()
+               -> Eff r ()
 serveDirectory = serveDirectoryWith defaultDirectoryConfig
 {-# INLINE serveDirectory #-}
 
@@ -497,10 +501,10 @@ serveDirectory = serveDirectoryWith defaultDirectoryConfig
 -- requested file, and the file is served with the appropriate mime type if it
 -- is found. Absolute paths and \"@..@\" are prohibited to prevent files from
 -- being served from outside the sandbox.
-serveDirectoryWith :: MonadSnap m
-                   => DirectoryConfig m  -- ^ Configuration options
+serveDirectoryWith :: (Snap r, MemberU2 Lift (Lift IO) r)
+                   => DirectoryConfig (Eff r) -- ^ Configuration options
                    -> FilePath           -- ^ Directory to serve from
-                   -> m ()
+                   -> Eff r ()
 serveDirectoryWith cfg base = do
     b <- directory <|> file <|> redir
     when (not b) pass
@@ -554,19 +558,19 @@ serveDirectoryWith cfg base = do
 -- does not exist, throws an exception (not that it does /not/ pass to the
 -- next handler).   The path restrictions on 'serveDirectory' don't apply to
 -- this function since the path is not being supplied by the user.
-serveFile :: MonadSnap m
+serveFile :: (Snap r, MemberU2 Lift (Lift IO) r)
           => FilePath          -- ^ path to file
-          -> m ()
+          -> Eff r ()
 serveFile fp = serveFileAs (fileType defaultMimeTypes (takeFileName fp)) fp
 {-# INLINE serveFile #-}
 
 
 ------------------------------------------------------------------------------
 -- | Same as 'serveFile', with control over the MIME mapping used.
-serveFileAs :: MonadSnap m
+serveFileAs :: (Snap r, MemberU2 Lift (Lift IO) r)
             => ByteString        -- ^ MIME type
             -> FilePath          -- ^ path to file
-            -> m ()
+            -> Eff r ()
 serveFileAs mime fp = do
     reqOrig <- getRequest
 
@@ -620,7 +624,7 @@ serveFileAs mime fp = do
     -- partial response if it matches.
     wasRange <- if skipRangeCheck
                   then return False
-                  else liftSnap $ checkRangeReq req fp sz
+                  else checkRangeReq req fp sz
 
     dbg $ "was this a range request? " ++ Prelude.show wasRange
 
@@ -628,7 +632,7 @@ serveFileAs mime fp = do
     unless wasRange $ do
       modifyResponse $ setResponseCode 200
                      . setContentLength sz
-      liftSnap $ sendFile fp
+      sendFile fp
 
   where
     --------------------------------------------------------------------------
@@ -682,7 +686,8 @@ rangeParser = string "bytes=" *>
 
 
 ------------------------------------------------------------------------------
-checkRangeReq :: (MonadSnap m) => Request -> FilePath -> Int64 -> m Bool
+checkRangeReq :: (Snap r, MemberU2 Lift (Lift IO) r)
+              => Request -> FilePath -> Int64 -> Eff r Bool
 checkRangeReq req fp sz = do
     -- TODO/FIXME: multiple ranges
     maybe (return False)

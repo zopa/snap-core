@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns     #-}
+{-# LANGUAGE ConstraintKinds  #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE Rank2Types       #-}
 module Snap.Internal.Routing where
@@ -13,7 +14,7 @@ import           Data.Monoid
 import           Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as H
 import qualified Data.Map as Map
-
+import           Eff
 ------------------------------------------------------------------------------
 import           Snap.Internal.Http.Types
 import           Snap.Internal.Parsing
@@ -40,11 +41,11 @@ triggering its fallback. It's NoRoute, so we go to the nearest parent
 fallback and try that, which is the baz action.
 
 -}
-data Route a m = Action ((MonadSnap m) => m a)   -- wraps a 'Snap' action
+data Route a r = Action ((Snap r) => Eff r a)   -- wraps a 'Snap' action
                -- captures the dir in a param
-               | Capture ByteString (Route a m) (Route a m)
+               | Capture ByteString (Route a r) (Route a r)
                -- match on a dir
-               | Dir (HashMap ByteString (Route a m)) (Route a m)
+               | Dir (HashMap ByteString (Route a r)) (Route a r)
                | NoRoute
 
 
@@ -173,7 +174,7 @@ routeEarliestNC r n = case r of
 -- This behaviour changed as of Snap 0.6.1; previous versions had unspecified
 -- (and buggy!) semantics here.
 --
-route :: MonadSnap m => [(ByteString, m a)] -> m a
+route :: Snap r => [(ByteString, Eff r a)] -> Eff r a
 route rts = do
   p <- getsRequest rqPathInfo
   route' (return ()) [] (splitPath p) Map.empty rts'
@@ -187,7 +188,7 @@ route rts = do
 -- change the request's context path. This is useful if you want to route to a
 -- particular handler but you want that handler to receive the 'rqPathInfo' as
 -- it is.
-routeLocal :: MonadSnap m => [(ByteString, m a)] -> m a
+routeLocal :: Snap r => [(ByteString, Eff r a)] -> Eff r a
 routeLocal rts = do
     req    <- getRequest
     let ctx = rqContextPath req
@@ -208,7 +209,7 @@ splitPath = B.splitWith (== (c2w '/'))
 
 
 ------------------------------------------------------------------------------
-pRoute :: MonadSnap m => (ByteString, m a) -> Route a m
+pRoute :: Snap r => (ByteString, Eff r a) -> Route a r
 pRoute (r, a) = foldr f (Action a) hier
   where
     hier   = filter (not . B.null) $ B.splitWith (== (c2w '/')) r
@@ -219,14 +220,14 @@ pRoute (r, a) = foldr f (Action a) hier
 
 
 ------------------------------------------------------------------------------
-route' :: MonadSnap m
-       => m ()           -- ^ action to run before we call the user handler
+route' :: Snap r
+       => Eff r ()           -- ^ action to run before we call the user handler
        -> [ByteString]   -- ^ the \"context\"; the list of path segments we've
                          -- already successfully matched, in reverse order
        -> [ByteString]   -- ^ the list of path segments we haven't yet matched
        -> Params
-       -> Route a m
-       -> m a
+       -> Route a r
+       -> Eff r a
 route' pre !ctx _ !params (Action action) =
     localRequest (updateContextPath (B.length ctx') . updateParams)
                  (pre >> action)

@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns              #-}
+{-# LANGUAGE ConstraintKinds           #-}
 {-# LANGUAGE CPP                       #-}
 {-# LANGUAGE DeriveDataTypeable        #-}
 {-# LANGUAGE ExistentialQuantification #-}
@@ -69,11 +70,9 @@ module Snap.Util.FileUploads
 ------------------------------------------------------------------------------
 import           Control.Applicative
 import           Control.Arrow
-import           Control.Exception.Lifted     (Exception, Handler (..),
-                                               SomeException (..), bracket,
-                                               catch, catches, fromException,
-                                               mask, throwIO, toException)
+import           Control.Exception
 import           Control.Monad
+import           Control.Monad.IO.Class
 import           Data.Attoparsec.Char8
 import qualified Data.Attoparsec.Char8        as Atto
 import           Data.ByteString.Char8        (ByteString)
@@ -103,6 +102,8 @@ import           System.IO.Streams            (InputStream, MatchInfo (..),
 import qualified System.IO.Streams            as Streams
 import           System.IO.Streams.Attoparsec
 import           System.PosixCompat.Temp      (mkstemp)
+import           Eff                          hiding (bracket)
+import           ExtMTL                       hiding (bracket)
 ------------------------------------------------------------------------------
 import           Snap.Core
 import           Snap.Internal.Parsing
@@ -152,14 +153,14 @@ import qualified Snap.Types.Headers           as H
 -- threshold (currently 32KB), this function will throw a 'BadPartException'.
 
 handleFileUploads ::
-       (MonadSnap m) =>
+       (Snap r, MonadIO (Eff r)) =>
        FilePath                       -- ^ temporary directory
     -> UploadPolicy                   -- ^ general upload policy
     -> (PartInfo -> PartUploadPolicy) -- ^ per-part upload policy
     -> (PartInfo -> Either PolicyViolationException FilePath -> IO a)
                                       -- ^ user handler (see function
                                       -- description)
-    -> m [a]
+    -> Eff r [a]
 handleFileUploads tmpdir uploadPolicy partPolicy partHandler =
     handleMultipart uploadPolicy go
 
@@ -234,10 +235,10 @@ type PartProcessor a = PartInfo -> InputStream ByteString -> IO a
 -- threshold (currently 32KB), this function will throw a 'BadPartException'.
 --
 handleMultipart ::
-       (MonadSnap m) =>
+       (Snap r, MonadIO (Eff r)) =>
        UploadPolicy        -- ^ global upload policy
     -> PartProcessor a     -- ^ part processor
-    -> m [a]
+    -> Eff r [a]
 handleMultipart uploadPolicy origPartHandler = do
     hdrs <- liftM headers getRequest
     let (ct, mbBoundary) = getContentType hdrs
@@ -254,13 +255,18 @@ handleMultipart uploadPolicy origPartHandler = do
     -- not well-formed multipart? bomb out.
     guard (ct == "multipart/form-data")
 
-    boundary <- maybe (throwIO $ BadPartException
+    boundary <- maybe (throw $ BadPartException
                        "got multipart/form-data without boundary")
                       return
                       mbBoundary
-
-    captures <- runRequestBody (proc bumpTimeout boundary partHandler) `catch`
-                terminateSlow
+    -- BD: It's not at all clear to me what the 'catch' here was meant to
+    -- accomplish. Doesn't it just do what runRequestBody was already doing
+    -- (ie terminate the connection and rethrow the exception)?
+    --
+    -- Since we can't (at the moment) catch IO exceptions in Eff code, 
+    -- just let the exception through here.
+    captures <- runRequestBody (proc bumpTimeout boundary partHandler) 
+             -- `catch` terminateSlow
     procCaptures captures id
 
   where
@@ -270,7 +276,7 @@ handleMultipart uploadPolicy origPartHandler = do
     maxFormVars = maximumNumberOfFormInputs uploadPolicy
 
     --------------------------------------------------------------------------
-    terminateSlow (e :: RateTooSlowException) = terminateConnection e
+    --terminateSlow (e :: RateTooSlowException) = terminateConnection e
 
     --------------------------------------------------------------------------
     proc bumpTimeout boundary partHandler stream = do
@@ -284,7 +290,7 @@ handleMultipart uploadPolicy origPartHandler = do
         rq <- getRequest
         let n = Map.size $ rqPostParams rq
         when (n >= maxFormVars) $
-          throwIO $ PolicyViolationException $
+          throw $ PolicyViolationException $
           T.concat [ "number of form inputs exceeded maximum of "
                    , T.pack $ show maxFormVars ]
         putRequest $ modifyParams (ins k v) rq

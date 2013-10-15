@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ConstraintKinds   #-}
 
 -- | This module provides facilities for patching incoming 'Requests' to
 -- correct the value of 'rqClientAddr' if the snap server is running behind a
@@ -25,6 +26,7 @@ import           Control.Arrow (second)
 import qualified Data.ByteString.Char8 as S
 import           Data.Char (isSpace)
 import           Data.Maybe (fromJust)
+import           Eff
 ------------------------------------------------------------------------------
 import           Snap.Core
 ------------------------------------------------------------------------------
@@ -44,7 +46,7 @@ data ProxyType = NoProxy          -- ^ no proxy, leave the request alone
 
 ------------------------------------------------------------------------------
 -- | Rewrite 'rqClientAddr' if we're behind a proxy.
-behindProxy :: MonadSnap m => ProxyType -> m a -> m a
+behindProxy :: Snap r => ProxyType -> Eff r a -> Eff r a
 behindProxy NoProxy         = id
 behindProxy X_Forwarded_For = ((modifyRequest xForwardedFor) >>)
 {-# INLINE behindProxy #-}
